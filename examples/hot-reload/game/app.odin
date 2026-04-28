@@ -25,7 +25,8 @@ app_startup :: proc(allocator: runtime.Allocator) -> (k2_state: ^k2.State) {
 		"Karl2D: Hot Reload Example",
 		allocator = allocator,
 		options = {
-			.Windowed_Resizable,
+			window_mode = .Windowed_Resizable,
+            disable_auto_scale_hint = false
 		}
 	)
 }

@@ -32,7 +32,8 @@ import hm "core:container/handle_map"
 // all dynamically allocated memory.
 //
 // `screen_width` and `screen_height` refer to the resolution of the drawable area of the window.
-// The window might be slightly larger due to borders and headers.
+// The window might be slightly larger due to borders and headers. The true width and height will be
+// scaled up by the scaling setting in the operating system.
 //
 // The return value is a pointer to Karl2D's internal state. You can restore this state later using
 // `set_internal_state()`. This is useful for example when doing game code reload, as the state may
@@ -374,7 +375,7 @@ process_events :: proc() {
 			}
 
 		case Event_Window_Scale_Changed:
-			// Doesn't do anything, only here so people can fetch it via `get_events()`.
+			rb.resize_swapchain(e.screen_width, e.screen_height)
 		}
 	}
 }
@@ -450,6 +451,11 @@ get_window_scale :: proc() -> f32 {
 // Use to change between windowed mode, resizable windowed mode and fullscreen
 set_window_mode :: proc(window_mode: Window_Mode) {
 	pf.set_window_mode(window_mode)
+}
+
+// Hide or show the OS cursor.
+set_cursor_visible :: proc(visible: bool) {
+	pf.set_cursor_visible(visible)
 }
 
 // Flushes the current batch. This sends off everything to the GPU that has been queued in the
@@ -977,6 +983,19 @@ draw_texture_fit :: proc(
 		source.h = -source.h
 	}
 
+	// HACK: We ask the render backend if this texture needs flipping. The idea is that GL will
+	// flip render textures, so we need to automatically unflip them.
+	//
+	// Could we do something with the projection matrix while drawing into those render textures
+	// instead? I tried that, but couldn't get it to work.
+	if rb.texture_needs_vertical_flip(texture.handle) {
+		flip_y = !flip_y
+
+		if source.h != f32(texture.height) {
+			source.y = f32(texture.height) - source.h - source.y
+		}
+	}
+
 	if dest.w < 0 {
 		dest.w *= -1
 	}
@@ -1045,15 +1064,6 @@ draw_texture_fit :: proc(
 		uv3.x += us.x
 		uv4.x -= us.x
 		uv5.x += us.x
-	}
-
-	// HACK: We ask the render backend if this texture needs flipping. The idea is that GL will
-	// flip render textures, so we need to automatically unflip them.
-	//
-	// Could we do something with the projection matrix while drawing into those render textures
-	// instead? I tried that, but couldn't get it to work.
-	if rb.texture_needs_vertical_flip(texture.handle) {
-		flip_y = !flip_y
 	}
 
 	if flip_y {
@@ -1151,7 +1161,8 @@ measure_text_ex :: proc(font_handle: Font, text: string, font_size: f32) -> Vec2
 }
 
 // Draw text at a position, with a size and color. The position is the top-left position of the
-// text.
+// text. If you've set a camera using `set_camera`, then the font size will be internally scaled
+// so that the text appear sharp.
 //
 // Optional parameters:
 // - font: The font to use, uses a default font if none is specified.
@@ -1172,20 +1183,31 @@ draw_text :: proc(
 
 	_set_font(font)
 	font_object := &s.fonts[font]
-	fs.SetSize(&s.fs, font_size)
-	iter := fs.TextIterInit(&s.fs, position.x, position.y, text)
+
+	camera_zoom: f32 = 1
+
+	if cam, cam_ok := s.batch_camera.?; cam_ok && cam.zoom > 0.001 {
+		camera_zoom = cam.zoom
+	}
+
+	// Bake the glyph at font_size*camera_zoom pixels so it is sharp at the current zoom level.
+	// We then divide quad positions back by camera_zoom to recover world-space coordinates.
+	render_size := font_size * camera_zoom
+	scaled_pos  := position * camera_zoom
+
+	fs.SetSize(&s.fs, render_size)
+	iter := fs.TextIterInit(&s.fs, scaled_pos.x, scaled_pos.y, text)
 
 	q: fs.Quad
 	for fs.TextIterNext(&s.fs, &iter, &q) {
 		if iter.codepoint == '\n' {
-			iter.nexty += font_size
-			iter.nextx = position.x
+			iter.nexty += render_size
+			iter.nextx = scaled_pos.x
 			continue
 		}
 
 		if iter.codepoint == '\t' {
-			// This is not really correct, but I'll replace it later when I redo the font stuff.
-			iter.nextx += 2*font_size
+			iter.nextx += 2*render_size
 			continue
 		}
 
@@ -1196,18 +1218,23 @@ draw_text :: proc(
 
 		w := f32(FONT_DEFAULT_ATLAS_SIZE)
 		h := f32(FONT_DEFAULT_ATLAS_SIZE)
-
 		src.x *= w
 		src.y *= h
 		src.w *= w
 		src.h *= h
 
+		// Unscale quad positions from atlas-space back to world-space.
+		qx0 := q.x0 / camera_zoom
+		qy0 := q.y0 / camera_zoom
+		qx1 := q.x1 / camera_zoom
+		qy1 := q.y1 / camera_zoom
+		
 		dst := Rect {
 			position.x, position.y,
-			q.x1 - q.x0, q.y1 - q.y0,
+			qx1 - qx0, qy1 - qy0,
 		}
 
-		char_origin := origin + {position.x - q.x0, position.y - q.y0}
+		char_origin := origin + {position.x - qx0, position.y - qy0}
 		draw_texture_fit(font_object.atlas, src, dst, char_origin, rotation, color)
 	}
 }
@@ -3518,6 +3545,10 @@ ui_button_width :: proc(text: string, button_height: f32) -> f32 {
 // when no camera is set.
 //
 // Mainly used by the samples in order to create the "Source" button.
+//
+// Note that this does not support zoomed cameras right now, since it uses unscaled mouse positions.
+// As this is experimental, you are probably better off copying this procedure to your own code and
+// modifying it, rather than using it as-is.
 ui_button :: proc(r: Rect, text: string) -> bool {
 	in_rect := point_in_rect(get_mouse_position(), r)
 	bg_color := DARK_GRAY
@@ -3695,6 +3726,15 @@ Window_Mode :: enum {
 
 Init_Options :: struct {
 	window_mode: Window_Mode,
+
+	// This hint may disable scaling of the window when created. Scaling here refers to the scaling
+	// that is set for the monitor in the OS settings (the same number returned by
+	// `get_window_scale`).
+	//
+	// Note that this is a _hint_. It only works on some platforms, such as Windows. On other
+	// platforms, such as Linux+Wayland, it does not work, because Wayland always auto scales all
+	// windows.
+	disable_auto_scale_hint: bool,
 }
 
 Shader_Handle :: distinct Handle
@@ -4301,6 +4341,8 @@ Event_Screen_Resize :: struct {
 // You can also use `k2.get_window_scale()`
 Event_Window_Scale_Changed :: struct {
 	scale: f32,
+	screen_width: int,
+	screen_height: int,
 }
 
 Event_Window_Focused :: struct {}
@@ -4452,7 +4494,7 @@ make_default_projection :: proc(w, h: int) -> matrix[4,4]f32 {
 	return matrix_ortho3d_f32(0, f32(w), f32(h), 0, 0.001, 2)
 }
 
-FONT_DEFAULT_ATLAS_SIZE :: 1024
+FONT_DEFAULT_ATLAS_SIZE :: 2048
 
 _update_font :: proc(fh: Font) {
 	font := &s.fonts[fh]
